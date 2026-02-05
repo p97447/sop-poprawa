@@ -1,0 +1,135 @@
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), exit(EXIT_FAILURE))
+#define FS_NUM 3
+
+typedef struct dron
+{
+    int id;
+    pthread_t tid;
+    sem_t* semaphore;
+    unsigned int sleep_time;
+    pthread_barrier_t* barrier;
+    pid_t analyzer_pid;
+} dron;
+
+void ms_sleep(unsigned int milli)
+{
+    struct timespec ts = {milli / 1000, (milli % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+void* do_work(void* p)
+{
+    dron* args = (dron*)p;
+
+    if (sem_wait(args->semaphore))
+        ERR("sem_wait");
+
+    ms_sleep(args->sleep_time);
+    printf("DRONE <%d>: FINISHED MINING\n", args->id);
+
+    if (sem_post(args->semaphore))
+        ERR("sem_post");
+
+    int res = pthread_barrier_wait(args->barrier);
+    if (res == PTHREAD_BARRIER_SERIAL_THREAD)
+    {
+        printf("ALL DRONES FINISHED MINING\n");
+        kill(args->analyzer_pid, SIGUSR1);
+    }
+
+    pthread_barrier_wait(args->barrier);
+    return NULL;
+}
+
+void usage(char* name)
+{
+    printf("%s N\n", name);
+    printf("10 <= N <= 20\n");
+    exit(EXIT_FAILURE);
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc != 2)
+        usage(argv[0]);
+
+    int N = atoi(argv[1]);
+    if (N < 10 || N > 20)
+        usage(argv[0]);
+
+    /* === BLOKUJEMY SIGUSR1 PRZED FORK === */
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL))
+        ERR("sigprocmask");
+
+    /* === PROCES ANALIZATORA === */
+    pid_t analyzer_pid = fork();
+    if (analyzer_pid < 0)
+        ERR("fork");
+
+    if (analyzer_pid == 0)
+    {
+        int sig;
+        while (1)
+        {
+            sigwait(&mask, &sig);
+            printf("ANALYZER: STARTED\n");
+            ms_sleep(500);
+            printf("ANALYZER: FINISHED\n");
+        }
+        exit(EXIT_SUCCESS);
+    }
+
+    /* === RODZIC: DRONY === */
+    dron* tab = malloc(N * sizeof(dron));
+    if (!tab)
+        ERR("malloc");
+
+    sem_t semaphore;
+    if (sem_init(&semaphore, 0, FS_NUM))
+        ERR("sem_init");
+
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, N);
+
+    for (int i = 0; i < N; i++)
+    {
+        tab[i].id = i;
+        tab[i].semaphore = &semaphore;
+        tab[i].sleep_time = 200;
+        tab[i].barrier = &barrier;
+        tab[i].analyzer_pid = analyzer_pid;
+
+        if (pthread_create(&tab[i].tid, NULL, do_work, &tab[i]))
+            ERR("pthread_create");
+    }
+
+    for (int i = 0; i < N; i++)
+        pthread_join(tab[i].tid, NULL);
+
+    /* === SPRZĄTANIE === */
+    kill(analyzer_pid, SIGTERM);
+    wait(NULL);
+
+    sem_destroy(&semaphore);
+    pthread_barrier_destroy(&barrier);
+    free(tab);
+
+    return EXIT_SUCCESS;
+}
