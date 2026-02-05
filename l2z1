@@ -1,0 +1,107 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <string.h>
+
+// Globalny licznik odebranych sygnałów
+volatile sig_atomic_t signal_count = 0;
+
+// Obsługa sygnału SIGUSR1
+void handle_sigusr1(int sig) {
+    signal_count++;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Użycie: %s <cyfra1> <cyfra2> ...\n", argv[0]);
+        return 1;
+    }
+
+    int num_children = argc - 1;
+    pid_t pids[num_children];
+
+    for (int i = 0; i < num_children; i++) {
+        int n = atoi(argv[i + 1]);
+        if (n < 0 || n > 9) {
+            fprintf(stderr, "Parametr %d nie jest cyfrą z przedziału [0-9]. Pomijam.\n", n);
+            continue;
+        }
+
+        pid_t pid = fork();
+
+        if (pid < 0) {
+            perror("Błąd fork");
+            exit(1);
+        }
+
+        if (pid == 0) {
+            // --- PROCES POTOMNY ---
+            srand(getpid() ^ time(NULL));
+            
+            // Losowanie s z przedziału [10-100] KB
+            int s_kb = (rand() % 91) + 10;
+            size_t s_bytes = s_kb * 1024;
+
+            // Ustawienie obsługi sygnału
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = handle_sigusr1;
+            sigaction(SIGUSR1, &sa, NULL);
+
+            // Tworzenie nazwy pliku PID.txt
+            char filename[32];
+            sprintf(filename, "%d.txt", getpid());
+
+            // Otwarcie pliku (niskopoziomowo) - Etap 6: Ochrona zapisu
+            int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                perror("Błąd open");
+                exit(1);
+            }
+
+            // Przygotowanie bufora danych (blok o rozmiarze s)
+            char *buffer = malloc(s_bytes);
+            memset(buffer, n + '0', s_bytes);
+
+            // Czekanie około 1 sekundy na sygnały od rodzica
+            usleep(1000000); 
+
+            // Zapisywanie bloków do pliku - Etap 5: Tyle bloków ile odebrano sygnałów
+            for (int j = 0; j < signal_count; j++) {
+                size_t total_written = 0;
+                // Etap 6: Pętla zapewniająca zapisanie pełnego rozmiaru s
+                while (total_written < s_bytes) {
+                    ssize_t written = write(fd, buffer + total_written, s_bytes - total_written);
+                    if (written <= 0) break;
+                    total_written += written;
+                }
+            }
+
+            free(buffer);
+            close(fd);
+            exit(0);
+        } else {
+            // --- PROCES RODZIC ---
+            pids[i] = pid;
+        }
+    }
+
+    // Proces rodzic: przez 1 sekundę co 10 ms wysyła SIGUSR1
+    for (int i = 0; i < 100; i++) {
+        for (int j = 0; j < num_children; j++) {
+            kill(pids[j], SIGUSR1);
+        }
+        usleep(10000); // 10 ms
+    }
+
+    // Oczekiwanie na zakończenie procesów potomnych
+    for (int i = 0; i < num_children; i++) {
+        wait(NULL);
+    }
+
+    return 0;
+}
