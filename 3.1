@@ -1,0 +1,140 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdbool.h>
+
+// Struktura dla danych wątku
+typedef struct {
+    int id;
+    int multiplier;
+} thread_data_t;
+
+// Zmienne globalne do synchronizacji
+int L = 0;
+int n_threads = 0;
+int checked_counter = 0;
+volatile sig_atomic_t keep_running = 1;
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond_start_check = PTHREAD_COND_INITIALIZER;
+pthread_cond_t cond_all_checked = PTHREAD_COND_INITIALIZER;
+
+// Obsługa sygnału SIGINT
+void handle_sigint(int sig) {
+    keep_running = 0;
+    // Wybudzenie wątków czekających na zmiennych warunkowych
+    pthread_cond_broadcast(&cond_start_check);
+    pthread_cond_broadcast(&cond_all_checked);
+}
+
+void* worker_function(void* arg) {
+    thread_data_t* data = (thread_data_t*)arg;
+    
+    // Etap 1 & 2: Rejestracja działania i losowanie mnożnika
+    data->multiplier = (rand() % 99) + 2; // Zakres [2, 100]
+    printf("[Wątek %d] Uruchomiony. Mnożnik M = %d *\n", data->id, data->multiplier);
+
+    int last_processed_L = 0;
+
+    while (keep_running) {
+        pthread_mutex_lock(&mutex);
+
+        // Czekaj, aż L zostanie zwiększone i będzie nową wartością do sprawdzenia
+        while (keep_running && (L <= last_processed_L)) {
+            pthread_cond_wait(&cond_start_check, &mutex);
+        }
+
+        if (!keep_running) {
+            pthread_mutex_unlock(&mutex);
+            break;
+        }
+
+        // Sprawdzenie podzielności (Etap 3)
+        if (L % data->multiplier == 0) {
+            printf("Wątek %d: L=%d jest podzielne przez M=%d\n", data->id, L, data->multiplier);
+        }
+
+        last_processed_L = L;
+        checked_counter++;
+
+        // Jeśli to ostatni wątek, powiadom wątek główny
+        if (checked_counter == n_threads) {
+            pthread_cond_signal(&cond_all_checked);
+        }
+
+        pthread_mutex_unlock(&mutex);
+    }
+
+    printf("[Wątek %d] Kończę pracę.\n", data->id);
+    return NULL;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Użycie: %s <liczba_wątków>\n", argv[0]);
+        return 1;
+    }
+
+    n_threads = atoi(argv[1]);
+    srand(time(NULL));
+
+    // Rejestracja sygnału (Etap 5)
+    struct sigaction sa;
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+
+    pthread_t threads[n_threads];
+    thread_data_t t_data[n_threads];
+
+    // Tworzenie wątków (Etap 1)
+    for (int i = 0; i < n_threads; i++) {
+        t_data[i].id = i;
+        if (pthread_create(&threads[i], NULL, worker_function, &t_data[i]) != 0) {
+            perror("Błąd pthread_create");
+            return 1;
+        }
+    }
+
+    printf("Wątek główny: Start odliczania co 0.1s. Naciśnij Ctrl+C, aby zakończyć.\n");
+
+    while (keep_running) {
+        pthread_mutex_lock(&mutex);
+        
+        L++; // Zwiększenie licznika
+        checked_counter = 0;
+        
+        // Powiadom wątki, że mogą sprawdzać (Etap 4 - Ochrona L)
+        pthread_cond_broadcast(&cond_start_check);
+
+        // Czekaj, aż wszystkie wątki sprawdzą aktualne L
+        while (keep_running && checked_counter < n_threads) {
+            pthread_cond_wait(&cond_all_checked, &mutex);
+        }
+
+        pthread_mutex_unlock(&mutex);
+
+        usleep(100000); // 0.1 sekundy
+    }
+
+    // Zamykanie programu (Etap 5)
+    printf("\nOtrzymano SIGINT. Zamykanie wątków...\n");
+    
+    // Budzimy wątki raz jeszcze na wypadek, gdyby utknęły w wait
+    pthread_cond_broadcast(&cond_start_check);
+
+    for (int i = 0; i < n_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    printf("Wątek główny: Wszystkie wątki zakończone. Koniec.\n");
+
+    pthread_mutex_destroy(&mutex);
+    pthread_cond_destroy(&cond_start_check);
+    pthread_cond_destroy(&cond_all_checked);
+
+    return 0;
+}
