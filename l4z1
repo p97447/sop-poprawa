@@ -1,0 +1,194 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <stdbool.h>
+
+// --- Struktury danych ---
+
+typedef struct Node {
+    char *line;
+    struct Node *prev;
+    struct Node *next;
+} Node;
+
+typedef struct {
+    Node *head;
+    Node *tail;
+} LinkedList;
+
+typedef struct {
+    long start;
+    long end;
+    int id;
+} Task;
+
+// --- Zmienne globalne (Synchronizacja) ---
+
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t error_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t worker_cond = PTHREAD_COND_INITIALIZER;
+
+Task *task_queue;
+int tasks_remaining;
+int current_task_idx = 0;
+
+LinkedList *result_lists; // Tablica list dla każdego fragmentu
+int expected_commas = 0;
+bool error_occurred = false;
+int active_workers = 0;
+int error_line = -1;
+
+// --- Funkcje pomocnicze listy ---
+
+void add_to_list(LinkedList *list, const char *line) {
+    Node *new_node = malloc(sizeof(Node));
+    new_node->line = strdup(line);
+    new_node->next = NULL;
+    new_node->prev = list->tail;
+    if (list->tail) list->tail->next = new_node;
+    else list->head = new_node;
+    list->tail = new_node;
+}
+
+// --- Logika wątków ---
+
+void* worker_routine(void* arg) {
+    int thread_id = *(int*)arg;
+    free(arg);
+
+    while (true) {
+        Task current_task;
+
+        // Pobranie zadania z puli
+        pthread_mutex_lock(&queue_mutex);
+        if (tasks_remaining <= 0 || error_occurred) {
+            active_workers--;
+            pthread_mutex_unlock(&queue_mutex);
+            break;
+        }
+        current_task = task_queue[current_task_idx++];
+        tasks_remaining--;
+        active_workers++;
+        pthread_mutex_unlock(&queue_mutex);
+
+        printf("[Wątek %d] Przetwarzam fragment %d: Start=%ld, Rozmiar=%ld bajtów\n", 
+                thread_id, current_task.id, current_task.start, current_task.end - current_task.start);
+
+        FILE *fp = fopen("data.csv", "r"); // Uproszczenie dla przykładu, w produkcji użyć path
+        fseek(fp, current_task.start, SEEK_SET);
+
+        char buffer[1024];
+        long current_pos = current_task.start;
+        int local_line_num = 0; // Uproszczone liczenie linii dla fragmentu
+
+        // Czytanie fragmentu
+        while (current_pos < current_task.end && fgets(buffer, sizeof(buffer), fp)) {
+            current_pos = ftell(fp);
+            buffer[strcspn(buffer, "\n")] = 0; // Usuń znak nowej linii
+
+            // Walidacja CSV
+            int commas = 0;
+            for (int i = 0; buffer[i]; i++) if (buffer[i] == ',') commas++;
+
+            if (commas != expected_commas) {
+                pthread_mutex_lock(&error_mutex);
+                if (!error_occurred) {
+                    error_occurred = true;
+                    error_line = current_task.id; // Przykładowo raportujemy numer fragmentu/linii
+                    fprintf(stderr, "BŁĄD: Niepoprawna liczba przecinków w fragmencie %d\n", current_task.id);
+                }
+                pthread_mutex_unlock(&error_mutex);
+                break;
+            }
+
+            add_to_list(&result_lists[current_task.id], buffer);
+        }
+        fclose(fp);
+
+        pthread_mutex_lock(&queue_mutex);
+        active_workers--;
+        pthread_mutex_unlock(&queue_mutex);
+
+        if (error_occurred) break;
+    }
+
+    return NULL;
+}
+
+// --- Funkcja główna ---
+
+int main(int argc, char *argv[]) {
+    if (argc < 4) {
+        printf("Użycie: %s <n_wątków> <m_fragmentów> <ścieżka>\n", argv[0]);
+        return 1;
+    }
+
+    int n = atoi(argv[1]);
+    int m = atoi(argv[2]);
+    char *path = argv[3];
+
+    // 1. Wątek główny czyta nagłówek i rozmiar
+    FILE *fp = fopen(path, "r");
+    if (!fp) { perror("Błąd otwarcia pliku"); return 1; }
+
+    struct stat st;
+    stat(path, &st);
+    long file_size = st.st_size;
+
+    char header[1024];
+    fgets(header, sizeof(header), fp);
+    long header_len = ftell(fp);
+
+    // Liczenie przecinków w nagłówku
+    for (int i = 0; header[i]; i++) if (header[i] == ',') expected_commas++;
+
+    // 2. Podział na m fragmentów
+    long data_size = file_size - header_len;
+    long chunk_size = data_size / m;
+    task_queue = malloc(sizeof(Task) * m);
+    result_lists = calloc(m, sizeof(LinkedList));
+    tasks_remaining = m;
+
+    for (int i = 0; i < m; i++) {
+        task_queue[i].id = i;
+        task_queue[i].start = header_len + (i * chunk_size);
+        task_queue[i].end = (i == m - 1) ? file_size : (header_len + (i + 1) * chunk_size);
+    }
+
+    // 3. Tworzenie puli n wątków
+    pthread_t *threads = malloc(sizeof(pthread_t) * n);
+    active_workers = 0;
+    for (int i = 0; i < n; i++) {
+        int *id = malloc(sizeof(int));
+        *id = i;
+        pthread_create(&threads[i], NULL, worker_routine, id);
+    }
+
+    // Oczekiwanie na wątki
+    for (int i = 0; i < n; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    if (error_occurred) {
+        free(threads);
+        free(task_queue);
+        return 1;
+    }
+
+    // 4. Łączenie list i wypisywanie (jeden wątek - tutaj main)
+    printf("\n--- WYNIK PRZETWARZANIA ---\n");
+    for (int i = 0; i < m; i++) {
+        Node *curr = result_lists[i].head;
+        while (curr) {
+            printf("%s\n", curr->line);
+            curr = curr->next;
+        }
+    }
+
+    // Czyszczenie
+    free(threads);
+    free(task_queue);
+    return 0;
+}
