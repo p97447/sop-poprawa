@@ -1,0 +1,164 @@
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), exit(EXIT_FAILURE))
+#define FS_NUM 3
+
+volatile sig_atomic_t last_signal = 0;
+
+typedef struct dron
+{
+    pid_t pid;
+    int id;
+    pthread_t tid;
+    sem_t* semaphore;
+    unsigned int sleep_time;
+    pthread_barrier_t* barrier;
+    sigset_t* pMask;
+} dron;
+
+void sethandler(void (*f)(int), int sigNo)
+{
+    struct sigaction act;
+    memset(&act, 0, sizeof(struct sigaction));
+    act.sa_handler = f;
+    if (-1 == sigaction(sigNo, &act, NULL))
+        ERR("sigaction");
+}
+
+void sig_handler(int sig) { last_signal = sig; }
+
+void ms_sleep(unsigned int milli)
+{
+    struct timespec ts = {milli / 1000, (milli % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+void* do_work(void* p)
+{
+    dron* args = (dron*)p;
+
+    if (sem_wait(args->semaphore))
+        ERR("sem wait");
+    // udalo nam sie pozyskac wiertlo
+    ms_sleep(args->sleep_time);
+    // wypisujemy dron
+    printf("DRONE <%d>: FINISHED MINING\n", args->id);
+    // zwalniamy semafor i konczymy
+    if (sem_post(args->semaphore) == -1)
+        ERR("sem_post");
+    // poczekaj na barierze na reszte
+    int result = pthread_barrier_wait(args->barrier);
+    if (result == PTHREAD_BARRIER_SERIAL_THREAD)
+    {
+        printf("ALL DRONES FINISHED MINING\n");
+        // zmien 0 na pid procesu, przekazuj go przez argument
+        if (kill(args->pid, SIGUSR1))
+            ERR("kill");
+    }
+    pthread_barrier_wait(args->barrier);
+
+    return NULL;
+}
+
+void parent_work(sigset_t oldmask)
+{
+    while (1)
+    {
+        last_signal = 0;
+        while (last_signal != SIGUSR1)
+            sigsuspend(&oldmask);
+        printf("ANALYZER: STARTED\n");
+        ms_sleep(500);
+        printf("ANALYZER: FINISHED \n");
+        break;
+    }
+}
+
+
+void usage(int argc, char* argv[])
+{
+    printf("%s N\n", argv[0]);
+    printf("\t10 <= N <= 20 - number of drone threads\n");
+    exit(EXIT_FAILURE);
+}
+
+int main(int argc, char* argv[])
+{
+    // przyjmujemy parametr
+    if (argc != 2)
+        usage(argc, argv);
+    int N = atoi(argv[1]);
+    if (N < 10 || N > 20)
+        usage(argc, argv);
+    // tworzymy N watkow
+    dron* tab;
+    tab = (dron*)malloc(N * sizeof(dron));
+    if (tab == NULL)
+        ERR("malloc");
+
+    sigset_t oldMask, newMask;
+    sigemptyset(&newMask);
+    sigaddset(&newMask, SIGUSR1);
+    if (pthread_sigmask(SIG_BLOCK, &newMask, &oldMask))
+        ERR("SIG_BLOCK error");
+
+    // inicjalizujemy semafor
+    sem_t semaphore;
+    if (sem_init(&semaphore, 0, FS_NUM))
+        ERR("sem init");
+
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, N);
+
+
+    pid_t pid;
+    if ((pid = fork()) < 0)
+        ERR("fork");
+    if (pid == 0)
+        parent_work(oldMask);
+
+
+    for (int i = 0; i < N; i++)
+    {
+        tab[i].id = i;
+        tab[i].semaphore = &semaphore;
+        tab[i].sleep_time = 200;
+        tab[i].pMask = &newMask;
+        tab[i].barrier = &barrier;
+        tab[i].pid = pid;
+        if (pthread_create(&(tab[i].tid), NULL, do_work, &tab[i]))
+            ERR("create");
+    }
+
+    // tworyzmy proces sprawdzjaacy sygnaly
+    
+
+
+    for (int i = 0; i < N; i++)
+    {
+        if (pthread_join(tab[i].tid, NULL))
+            ERR("join");
+    }
+
+    if (pthread_sigmask(SIG_UNBLOCK, &newMask, &oldMask))
+        ERR("SIG_BLOCK error");
+
+    if (sem_destroy(&semaphore))
+        ERR("sem destroy");
+
+    pthread_barrier_destroy(&barrier);
+    free(tab);
+    return EXIT_SUCCESS;
+}
