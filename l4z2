@@ -1,0 +1,188 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <time.h>
+
+#define CARDS_PER_PLAYER 7
+#define TOTAL_CARDS 52
+
+// Struktura gracza
+typedef struct {
+    int id;
+    int cards[CARDS_PER_PLAYER];
+} Player;
+
+// Zmienne globalne do synchronizacji
+int N; // liczba graczy
+int deck[TOTAL_CARDS];
+int deck_ptr = 0;
+Player *players_data;
+pthread_t *threads;
+int current_players = 0;
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond_new_player = PTHREAD_COND_INITIALIZER;
+pthread_barrier_t game_barrier;
+
+int *exchange_slots; // Bufory do przekazywania kart
+volatile sig_atomic_t game_running = 0;
+volatile sig_atomic_t program_running = 1;
+volatile sig_atomic_t winner_found = 0;
+
+// Funkcje pomocnicze
+void shuffle_deck() {
+    for (int i = TOTAL_CARDS - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int temp = deck[i];
+        deck[i] = deck[j];
+        deck[j] = temp;
+    }
+    deck_ptr = 0;
+}
+
+bool check_win(int *hand) {
+    int suit = hand[0] % 4;
+    for (int i = 1; i < CARDS_PER_PLAYER; i++) {
+        if (hand[i] % 4 != suit) return false;
+    }
+    return true;
+}
+
+void print_hand(int id, int *hand) {
+    printf("Gracz %d: ", id);
+    for (int i = 0; i < CARDS_PER_PLAYER; i++) {
+        printf("[%d, k:%d] ", hand[i] / 4, hand[i] % 4);
+    }
+    printf("\n");
+}
+
+// Logika wątku gracza
+void* player_thread(void* arg) {
+    int id = *(int*)arg;
+    Player *me = &players_data[id];
+
+    pthread_mutex_lock(&mutex);
+    print_hand(id, me->cards);
+    pthread_mutex_unlock(&mutex);
+
+    // Czekaj na wszystkich graczy
+    pthread_barrier_wait(&game_barrier);
+
+    while (program_running && !winner_found) {
+        // 1. Sprawdź warunek zwycięstwa
+        if (check_win(me->cards)) {
+            winner_found = 1;
+            printf("\n--- My ship sails! ---\n");
+            print_hand(id, me->cards);
+        }
+
+        // Bariera: wszyscy muszą sprawdzić czy ktoś wygrał zanim przejdą dalej
+        pthread_barrier_wait(&game_barrier);
+        if (winner_found || !program_running) break;
+
+        // 2. Wybierz losową kartę i przekaż sąsiadowi (id + 1) % N
+        int idx_to_give = rand() % CARDS_PER_PLAYER;
+        int card_to_give = me->cards[idx_to_give];
+        exchange_slots[id] = card_to_give;
+
+        // Bariera: wszyscy muszą położyć kartę na stół
+        pthread_barrier_wait(&game_barrier);
+
+        // 3. Odbierz kartę od sąsiada z lewej
+        int neighbor_left = (id - 1 + N) % N;
+        me->cards[idx_to_give] = exchange_slots[neighbor_left];
+
+        // Bariera: koniec tury
+        pthread_barrier_wait(&game_barrier);
+    }
+
+    return NULL;
+}
+
+// Obsługa sygnałów
+void handle_sigusr1(int sig) {
+    // Sygnał do dodania gracza
+}
+
+void handle_sigint(int sig) {
+    program_running = 0;
+    winner_found = 1; // Przerywa pętle graczy
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printf("Użycie: %s <liczba_graczy (4-7)>\n", argv[0]);
+        return 1;
+    }
+
+    N = atoi(argv[1]);
+    if (N < 4 || N > 7) {
+        printf("Liczba graczy musi być w przedziale 4-7.\n");
+        return 1;
+    }
+
+    srand(time(NULL));
+    for (int i = 0; i < TOTAL_CARDS; i++) deck[i] = i;
+
+    // Rejestracja sygnałów
+    struct sigaction sa_usr1 = {.sa_handler = handle_sigusr1, .sa_flags = 0};
+    sigaction(SIGUSR1, &sa_usr1, NULL);
+    struct sigaction sa_int = {.sa_handler = handle_sigint, .sa_flags = 0};
+    sigaction(SIGINT, &sa_int, NULL);
+
+    players_data = malloc(N * sizeof(Player));
+    threads = malloc(N * sizeof(pthread_t));
+    exchange_slots = malloc(N * sizeof(int));
+
+    printf("Główny wątek: PID %d. Czekam na SIGUSR1...\n", getpid());
+
+    while (program_running) {
+        shuffle_deck();
+        current_players = 0;
+        winner_found = 0;
+        pthread_barrier_init(&game_barrier, NULL, N);
+
+        // Faza dołączania graczy
+        while (current_players < N && program_running) {
+            pause(); // Czekaj na dowolny sygnał (np. SIGUSR1)
+            
+            if (!program_running) break;
+
+            if (current_players < N) {
+                players_data[current_players].id = current_players;
+                for (int i = 0; i < CARDS_PER_PLAYER; i++) {
+                    players_data[current_players].cards[i] = deck[deck_ptr++];
+                }
+                
+                int *id_ptr = malloc(sizeof(int));
+                *id_ptr = current_players;
+                pthread_create(&threads[current_players], NULL, player_thread, id_ptr);
+                current_players++;
+                printf("Dodano gracza %d/%d.\n", current_players, N);
+            } else {
+                printf("Stół jest pełny!\n");
+            }
+        }
+
+        // Czekaj na zakończenie gry
+        for (int i = 0; i < current_players; i++) {
+            pthread_join(threads[i], NULL);
+        }
+        
+        pthread_barrier_destroy(&game_barrier);
+        if (program_running) {
+            printf("\nGra zakończona. Tasowanie i oczekiwanie na nową sesję...\n");
+        }
+    }
+
+    // Czyszczenie zasobów
+    free(players_data);
+    free(threads);
+    free(exchange_slots);
+    printf("Program zakończony poprawnie.\n");
+
+    return 0;
+}
