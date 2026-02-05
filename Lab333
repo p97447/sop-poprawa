@@ -1,0 +1,116 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/mman.h>
+
+// Struktura współdzielona między procesami (dla synchronizacji z Analizatorem)
+typedef struct {
+    sem_t analyzer_done;
+} shared_data_t;
+
+sem_t drills;
+pthread_barrier_t mining_barrier;
+shared_data_t *shared;
+pid_t analyzer_pid;
+int N;
+
+// Obsługa sygnału SIGUSR1 w procesie Analizatora
+void handle_sigusr1(int sig) {
+    printf("ANALYZER: STARTED\n");
+    usleep(500000); // 500ms
+    printf("ANALYZER: FINISHED\n");
+    sem_post(&shared->analyzer_done); // Powiadom drony o zakończeniu
+}
+
+void* drone_thread(void* arg) {
+    int id = *((int*)arg);
+    free(arg);
+
+    // Etap 1: Pobranie wiertła (max 3 drony naraz)
+    sem_wait(&drills);
+    
+    // Symulacja pracy
+    usleep(200000); // 200ms
+    printf("DRONE %d: FINISHED MINING\n", id);
+    
+    sem_post(&drills); // Zwrot wiertła
+
+    // Etap 2: Synchronizacja wszystkich dronów
+    int rc = pthread_barrier_wait(&mining_barrier);
+    
+    // Jeden z dronów wysyła sygnał do Analizatora
+    if (rc == PTHREAD_BARRIER_SERIAL_THREAD) {
+        printf("ALL DRONES FINISHED MINING!\n");
+        kill(analyzer_pid, SIGUSR1);
+    }
+
+    // Drony czekają, aż analizator skończy pracę
+    sem_wait(&shared->analyzer_done);
+    sem_post(&shared->analyzer_done); // "Przepuszczenie" pozostałych dronów
+
+    return NULL;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        printf("Użycie: %s <liczba_dronów>\n", argv[0]);
+        return 1;
+    }
+
+    N = atoi(argv[1]);
+    if (N < 10 || N > 20) {
+        printf("N musi być w przedziale [10, 20]\n");
+        return 1;
+    }
+
+    // Alokacja pamięci współdzielonej dla semafora międzyprocesowego
+    shared = mmap(NULL, sizeof(shared_data_t), PROT_READ | PROT_WRITE, 
+                  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    sem_init(&shared->analyzer_done, 1, 0);
+
+    // Inicjalizacja zasobów lokalnych
+    sem_init(&drills, 0, 3);
+    pthread_barrier_init(&mining_barrier, NULL, N);
+
+    analyzer_pid = fork();
+
+    if (analyzer_pid == 0) {
+        // PROCES ANALIZATORA
+        struct sigaction sa;
+        sa.sa_handler = handle_sigusr1;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGUSR1, &sa, NULL);
+
+        // Czeka na sygnał (pętla, dopóki nie skończy pracy)
+        pause(); 
+        exit(0);
+    } else {
+        // PROCES GŁÓWNY (DRONY)
+        pthread_t threads[N];
+
+        for (int i = 0; i < N; i++) {
+            int* id = malloc(sizeof(int));
+            *id = i;
+            pthread_create(&threads[i], NULL, drone_thread, id);
+        }
+
+        for (int i = 0; i < N; i++) {
+            pthread_join(threads[i], NULL);
+        }
+
+        wait(NULL); // Czekaj na zakończenie Analizatora
+        
+        // Czyszczenie
+        sem_destroy(&drills);
+        sem_destroy(&shared->analyzer_done);
+        pthread_barrier_destroy(&mining_barrier);
+        munmap(shared, sizeof(shared_data_t));
+    }
+
+    return 0;
+}
