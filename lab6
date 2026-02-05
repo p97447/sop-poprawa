@@ -19,7 +19,6 @@ volatile sig_atomic_t last_signal = 0;
 
 typedef struct dron
 {
-    pid_t pid;
     int id;
     pthread_t tid;
     sem_t* semaphore;
@@ -63,29 +62,14 @@ void* do_work(void* p)
     if (result == PTHREAD_BARRIER_SERIAL_THREAD)
     {
         printf("ALL DRONES FINISHED MINING\n");
-        // zmien 0 na pid procesu, przekazuj go przez argument
-        if (kill(args->pid, SIGUSR1))
+        // wysylamy sigusr1
+        if (kill(0, SIGUSR1))
             ERR("kill");
     }
     pthread_barrier_wait(args->barrier);
 
     return NULL;
 }
-
-void parent_work(sigset_t oldmask)
-{
-    while (1)
-    {
-        last_signal = 0;
-        while (last_signal != SIGUSR1)
-            sigsuspend(&oldmask);
-        printf("ANALYZER: STARTED\n");
-        ms_sleep(500);
-        printf("ANALYZER: FINISHED \n");
-        break;
-    }
-}
-
 
 void usage(int argc, char* argv[])
 {
@@ -122,14 +106,6 @@ int main(int argc, char* argv[])
     pthread_barrier_t barrier;
     pthread_barrier_init(&barrier, NULL, N);
 
-
-    pid_t pid;
-    if ((pid = fork()) < 0)
-        ERR("fork");
-    if (pid == 0)
-        parent_work(oldMask);
-
-
     for (int i = 0; i < N; i++)
     {
         tab[i].id = i;
@@ -137,14 +113,23 @@ int main(int argc, char* argv[])
         tab[i].sleep_time = 200;
         tab[i].pMask = &newMask;
         tab[i].barrier = &barrier;
-        tab[i].pid = pid;
         if (pthread_create(&(tab[i].tid), NULL, do_work, &tab[i]))
             ERR("create");
     }
 
     // tworyzmy proces sprawdzjaacy sygnaly
-    
-
+    sethandler(sig_handler, SIGUSR1);
+    // int signo;
+    while (1)
+    {
+        last_signal = 0;
+        while (last_signal != SIGUSR1)
+            sigsuspend(&oldMask);
+        printf("ANALYZER: STARTED\n");
+        ms_sleep(500);
+        printf("ANALYZER: FINISHED\n");
+        break;
+    }
 
     for (int i = 0; i < N; i++)
     {
