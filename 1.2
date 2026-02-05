@@ -1,0 +1,92 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+void scan_dir(const char *base_path, int max_depth, const char *ext, int current_depth, FILE *out) {
+    if (current_depth > max_depth) return;
+
+    DIR *dir = opendir(base_path);
+    if (!dir) return;
+
+    struct dirent *entry;
+    struct stat file_stat;
+    char path[1024];
+    int header_printed = 0;
+
+    // Najpierw wypisujemy pliki w bieżącym katalogu
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_REG) { // Tylko zwykłe pliki
+            // Filtrowanie rozszerzenia
+            if (ext != NULL) {
+                const char *dot = strrchr(entry->d_name, '.');
+                if (!dot || strcmp(dot + 1, ext) != 0) continue;
+            }
+
+            if (!header_printed) {
+                fprintf(out, "path: %s\n", base_path);
+                header_printed = 1;
+            }
+
+            snprintf(path, sizeof(path), "%s/%s", base_path, entry->d_name);
+            if (stat(path, &file_stat) == 0) {
+                fprintf(out, "%s %ld\n", entry->d_name, file_stat.st_size);
+            }
+        }
+    }
+
+    // Następnie rekurencyjnie wchodzimy do podkatalogów
+    rewinddir(dir);
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_type == DT_DIR) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+            snprintf(path, sizeof(path), "%s/%s", base_path, entry->d_name);
+            scan_dir(path, max_depth, ext, current_depth + 1, out);
+        }
+    }
+
+    closedir(dir);
+}
+
+int main(int argc, char *argv[]) {
+    char *paths[64];
+    int path_count = 0;
+    char *extension = NULL;
+    int depth = 999; // Domyślnie bardzo głęboko
+    int save_to_file = 0;
+    int opt;
+
+    while ((opt = getopt(argc, argv, "p:e:d:o")) != -1) {
+        switch (opt) {
+            case 'p': paths[path_count++] = optarg; break;
+            case 'e': extension = optarg; break;
+            case 'd': depth = atoi(optarg); break;
+            case 'o': save_to_file = 1; break;
+            default:
+                fprintf(stderr, "Użycie: %s -p <path> [-e ext] [-d depth] [-o]\n", argv[0]);
+                return 1;
+        }
+    }
+
+    FILE *out = stdout;
+    if (save_to_file) {
+        char *env_path = getenv("L1_OUTPUTFILE");
+        if (env_path) {
+            out = fopen(env_path, "w");
+            if (!out) {
+                perror("Błąd otwarcia pliku");
+                return 1;
+            }
+        }
+    }
+
+    for (int i = 0; i < path_count; i++) {
+        scan_dir(paths[i], depth, extension, 1, out);
+    }
+
+    if (out != stdout) fclose(out);
+    return 0;
+}
