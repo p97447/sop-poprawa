@@ -1,0 +1,99 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+
+void print_usage(const char *prog_name) {
+    fprintf(stderr, "Usage: %s [-p sciezka] [-o nazwa_pliku]\n", prog_name);
+}
+
+void list_directory(const char *path, FILE *output) {
+    DIR *dir = opendir(path);
+    if (dir == NULL) {
+        fprintf(stderr, "Błąd: Nie można otworzyć katalogu '%s': %s\n", path, strerror(errno));
+        return;
+    }
+
+    fprintf(output, "SCIEZKA:\n%s\nLISTA PLIKÓW:\n", path);
+
+    struct dirent *entry;
+    struct stat file_stat;
+    char full_path[1024];
+
+    while ((entry = readdir(dir)) != NULL) {
+        // Pomijamy kropki (opcjonalnie, ale zazwyczaj czytelniej)
+        // if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+
+        snprintf(full_path, sizeof(full_path), "%s/%s", path, entry->d_name);
+        
+        if (stat(full_path, &file_stat) == 0) {
+            fprintf(output, "%s %ld\n", entry->d_name, (long)file_stat.st_size);
+        } else {
+            fprintf(output, "%s ? (blad odczytu rozmiaru)\n", entry->d_name);
+        }
+    }
+    fprintf(output, "\n");
+    closedir(dir);
+}
+
+int main(int argc, char *argv[]) {
+    char *paths[100];
+    int path_count = 0;
+    char *output_file = NULL;
+    int opt;
+
+    // Parsowanie argumentów
+    while ((opt = getopt(argc, argv, "p:o:")) != -1) {
+        switch (opt) {
+            case 'p':
+                paths[path_count++] = optarg;
+                break;
+            case 'o':
+                if (output_file != NULL) {
+                    fprintf(stderr, "Błąd: Parametr -o może wystąpić tylko raz.\n");
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                output_file = optarg;
+                break;
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
+    }
+
+    // Sprawdzenie czy nie ma nadmiarowych parametrów pozycyjnych
+    if (optind < argc) {
+        fprintf(stderr, "Błąd: Nieobsługiwane parametry pozycyjne.\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    // Ustalenie strumienia wyjściowego
+    FILE *out_stream = stdout;
+    if (output_file != NULL) {
+        out_stream = fopen(output_file, "w");
+        if (out_stream == NULL) {
+            perror("Błąd otwarcia pliku wyjściowego");
+            return 1;
+        }
+    }
+
+    // Wykonanie listingu
+    if (path_count == 0) {
+        list_directory(".", out_stream);
+    } else {
+        for (int i = 0; i < path_count; i++) {
+            list_directory(paths[i], out_stream);
+        }
+    }
+
+    if (out_stream != stdout) {
+        fclose(out_stream);
+    }
+
+    return 0;
+}
