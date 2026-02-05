@@ -1,0 +1,231 @@
+#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), exit(EXIT_FAILURE))
+
+#define FS_NUM 3
+
+typedef struct thr_arg
+{
+    // musimy dodac bariere dziloena z thr_hus
+    int id;
+    sem_t* semaphore;
+    unsigned int seed;
+    int* left;
+    pthread_mutex_t* l_mutex;
+    bool done;
+    pthread_barrier_t* shared_barrier;
+} thr_arg;
+
+typedef struct thr_hus
+{
+    int* enemy_hp;
+    unsigned int seed;
+    pthread_barrier_t* barrier;
+    bool* fire;
+    pthread_mutex_t* hp_mutex;
+    pthread_mutex_t* fire_mutex;
+
+} thr_hus;
+
+void ms_sleep(unsigned int milli)
+{
+    struct timespec ts = {milli / 1000, (milli % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+void usage(int argc, char* argv[])
+{
+    printf("%s N M\n", argv[0]);
+    printf("\t10 <= N <= 20 - number of banner threads\n");
+    printf("\t2 <= N <= 8 - number of artillery threads\n");
+    exit(EXIT_FAILURE);
+}
+
+void* thread_func(void* p)
+{
+    thr_arg* args = (thr_arg*)p;
+    // losujemy czas spania
+    unsigned int tt = rand_r(&args->seed) % 40 + 80;
+
+    // akazdy musi przebyc, sprawdzamy czy semafor nam pozwala przejsc
+    while ((args->done) != true)
+    {
+        if (TEMP_FAILURE_RETRY(sem_trywait(args->semaphore)) == 0)
+        {
+            // udalo nam sie przjeechac
+            args->done = true;
+        }
+    }
+
+    // udalo nam sie zmniejszyc semafor, wiec mozemny przejechac
+    ms_sleep(tt);
+
+    // dostarlismy na miejsce
+    printf("cavalry %d in position\n", args->id);
+    pthread_mutex_lock(args->l_mutex);
+    *(args->left) -= 1;
+    pthread_mutex_unlock(args->l_mutex);
+
+    // mozemy zwikeszyc semafor, kolejny moze przejechac
+    if (sem_post(args->semaphore) == -1)
+        ERR("sem_post");
+
+    // tu musimy
+
+    return NULL;
+}
+
+void* hus_func(void* p)
+{
+    thr_hus* args = (thr_hus*)p;
+    int hp;
+    unsigned int ms = 400;
+
+    // tu sie zastanwo nad mutexem na fire
+    while (*(args->fire))
+    {
+        // dopoki mozemy
+
+        // losujemy wartosc 1-6
+        hp = rand_r(&args->seed) % 5 + 1;
+
+        // spimy 400 ms
+        ms_sleep(ms);
+
+        // oddajemy strzal - do tej pory jest dobrze
+        pthread_mutex_lock(args->hp_mutex);
+        *(args->enemy_hp) -= hp;
+        pthread_mutex_unlock(args->hp_mutex);
+
+        // czekamy na reszte
+        // int res = pthread_barrier_wait(args->barrier);
+
+        // sprawdzamy hp
+        pthread_mutex_lock(args->hp_mutex);
+        if (*(args->enemy_hp) < 50)
+        {
+            pthread_mutex_lock(args->fire_mutex);
+            *(args->fire) = false;
+            pthread_mutex_unlock(args->fire_mutex);
+        }
+        pthread_mutex_unlock(args->fire_mutex);
+    }
+    return NULL;
+}
+
+void do_work_hus(int n, int m, pthread_barrier_t* barrier)
+{
+    // inicjalizujemy zmienne husarii
+    thr_hus* hus_arg;
+    hus_arg = (thr_hus*)malloc(m * sizeof(thr_hus));
+    // inicjalizujemy bariere
+    int hp = 100;
+    pthread_mutex_t hp_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t fire_mutex = PTHREAD_MUTEX_INITIALIZER;
+    // pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    pthread_t* tab;
+    tab = (pthread_t*)malloc(sizeof(pthread_t));
+    bool fire = true;
+
+    for (int i = 0; i < m; i++)
+    {
+        hus_arg[i].barrier = barrier;
+        hus_arg[i].enemy_hp = &hp;
+        hus_arg[i].fire = &fire;
+        hus_arg[i].seed = rand();
+        hus_arg[i].hp_mutex = &hp_mutex;
+        hus_arg[i].fire_mutex = &fire_mutex;
+        // hus_arg[i].cond = &cond;
+        if (pthread_create(&tab[i], NULL, hus_func, &hus_arg[i]))
+            ERR("couldnt create");
+    }
+
+    for (int i = 0; i < m; i++)
+    {
+        if (pthread_join(tab[i], NULL))
+            ERR("couldnt join");
+    }
+
+    free(tab);
+    free(hus_arg);
+}
+
+void do_work(int n, int m)
+{
+    // inijcalizujemy wartosci w watkach
+    thr_arg* args;
+    if ((args = (thr_arg*)malloc(n * sizeof(thr_arg))) == NULL)
+        ERR("malloc");
+    pthread_t* f_threads;
+    if ((f_threads = (pthread_t*)malloc(n * sizeof(pthread_t))) == NULL)
+        ERR("malloc");
+    sem_t semaph;
+    if (sem_init(&semaph, 0, FS_NUM) != 0)
+        ERR("sem init");
+
+    int left = n;
+    pthread_mutex_t left_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, m);
+
+    // towryzmuy N watkow
+    for (int i = 0; i < n; i++)
+    {
+        args[i].id = i;
+        args[i].semaphore = &semaph;
+        args[i].seed = rand();
+        args[i].left = &left;
+        args[i].done = false;
+        args[i].shared_barrier = &barrier;
+        args[i].l_mutex = &left_mutex;
+        if (pthread_create(&f_threads[i], NULL, thread_func, (void*)&args[i]) != 0)
+            ERR("pthread create");
+    }
+
+    // robimy do_work dla husarii
+    do_work_hus(n, m, &barrier);
+
+    // czekamy na przylaczenie watkow
+    for (int i = 0; i < n; i++)
+    {
+        if (pthread_join(f_threads[i], NULL))
+            ERR("couldnt join");
+    }
+
+    free(args);
+    free(f_threads);
+    if (sem_destroy(&semaph))
+        ERR("sem destroy");
+}
+
+int main(int argc, char* argv[])
+{
+    // sprawdzanie arugmentow git
+    if (argc != 3)
+        usage(argc, argv);
+    int n, m;
+    n = atoi(argv[1]);
+    m = atoi(argv[2]);
+    if (n < 10 || n > 20)
+        usage(argc, argv);
+    if (m < 2 || m > 8)
+        usage(argc, argv);
+
+    // przekazywanie tez git
+    do_work(n, m);
+
+    return EXIT_SUCCESS;
+}
